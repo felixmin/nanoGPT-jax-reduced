@@ -9,12 +9,86 @@ https://github.com/huggingface/transformers/blob/main/src/transformers/models/gp
 
 import math
 from dataclasses import dataclass
-from typing import Optional
 
-import jax
-import jax.numpy as jnp
-import flax.linen as nn
-import optax
+import torch
+import torch.nn as nn
+from torch.nn import functional as F
+
+# @torch.jit.script # good to enable when not using torch.compile, disable when using (our default)
+def new_gelu(x):
+    """
+    Implementation of the GELU activation function currently in Google BERT repo (identical to OpenAI GPT).
+    Reference: Gaussian Error Linear Units (GELU) paper: https://arxiv.org/abs/1606.08415
+    """
+    return 0.5 * x * (1.0 + torch.tanh(math.sqrt(2.0 / math.pi) * (x + 0.044715 * torch.pow(x, 3.0))))
+
+class CausalSelfAttention(nn.Module):
+
+    def __init__(self, config):
+        super().__init__()
+        assert config.n_embd % config.n_head == 0
+        # key, query, value projections for all heads, but in a batch
+        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
+        # output projection
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd)
+        # regularization
+        self.attn_dropout = nn.Dropout(config.dropout)
+        self.resid_dropout = nn.Dropout(config.dropout)
+        # causal mask to ensure that attention is only applied to the left in the input sequence
+        self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
+                                    .view(1, 1, config.block_size, config.block_size))
+        self.n_head = config.n_head
+        self.n_embd = config.n_embd
+
+    def forward(self, x):
+        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
+
+        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
+        q, k ,v  = self.c_attn(x).split(self.n_embd, dim=2)
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+
+        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
+        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+        att = F.softmax(att, dim=-1)
+        att = self.attn_dropout(att)
+        y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
+
+        # output projection
+        y = self.resid_dropout(self.c_proj(y))
+        return y
+
+class MLP(nn.Module):
+
+    def __init__(self, config):
+        super().__init__()
+        self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd)
+        self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd)
+        self.dropout = nn.Dropout(config.dropout)
+
+    def forward(self, x):
+        x = self.c_fc(x)
+        x = new_gelu(x)
+        x = self.c_proj(x)
+        x = self.dropout(x)
+        return x
+
+class Block(nn.Module):
+
+    def __init__(self, config):
+        super().__init__()
+        self.ln_1 = nn.LayerNorm(config.n_embd)
+        self.attn = CausalSelfAttention(config)
+        self.ln_2 = nn.LayerNorm(config.n_embd)
+        self.mlp = MLP(config)
+
+    def forward(self, x):
+        x = x + self.attn(self.ln_1(x))
+        x = x + self.mlp(self.ln_2(x))
+        return x
 
 @dataclass
 class GPTConfig:
@@ -25,127 +99,53 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.1
 
-
-class CausalSelfAttention(nn.Module):
-    config: GPTConfig
-
-    def setup(self):
-        config = self.config
-        assert config.n_embd % config.n_head == 0
-        head_size = config.n_embd // config.n_head
-        # key, query, value projections for all heads, but in a batch
-        self.c_attn = nn.DenseGeneral((config.n_head, 3 * head_size))
-        # output projection
-        self.c_proj = nn.Dense(config.n_embd)
-        # regularization
-        self.attn_dropout = nn.Dropout(config.dropout)
-        self.resid_dropout = nn.Dropout(config.dropout)
-        # causal mask to ensure that attention is only applied to the left in the input sequence
-        self.n_head = config.n_head
-        self.n_embd = config.n_embd
-
-    def __call__(self, x: jax.Array, *, train: bool) -> jax.Array:
-        B, T, C = x.shape # batch size, sequence length, embedding dimensionality (n_embd)
-
-        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        c_attn = self.c_attn(x) # (B, T, hs, 3 * hs)
-        c_attn = c_attn.swapaxes(1, 2) # (B, nh, T, 3 * hs)
-        q, k, v = jnp.split(c_attn, 3, axis=-1) # (B, nh, T, hs)
-
-        with jax.ensure_compile_time_eval():
-            mask = jnp.tril(jnp.ones((T, T))).reshape((1, 1, T, T))
-        
-        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
-        att = (q @ k.swapaxes(-2, -1)) * (1.0 / jnp.sqrt(k.shape[-1]))
-        # att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-        att = jnp.where(mask == 0, float('-inf'), att)
-        att = nn.softmax(att, axis=-1)
-        att = self.attn_dropout(att, deterministic=not train)
-        y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
-        y = y.swapaxes(1, 2).reshape(B, T, C) # re-assemble all head outputs side by side
-
-        # output projection
-        y = self.resid_dropout(self.c_proj(y), deterministic=not train)
-        return y
-
-class MLP(nn.Module):
-    config: GPTConfig
-
-    def setup(self):
-        config = self.config
-        self.c_fc    = nn.Dense(4 * config.n_embd)
-        self.c_proj  = nn.Dense(config.n_embd)
-        self.dropout = nn.Dropout(config.dropout)
-
-    def __call__(self, x: jax.Array, *, train: bool) -> jax.Array:
-        x = self.c_fc(x)
-        x = nn.gelu(x, approximate=True)
-        x = self.c_proj(x)
-        x = self.dropout(x, deterministic=not train)
-        return x
-
-class Block(nn.Module):
-    config: GPTConfig
-
-    def setup(self):
-        config = self.config
-        self.ln_1 = nn.LayerNorm()
-        self.attn = CausalSelfAttention(config)
-        self.ln_2 = nn.LayerNorm()
-        self.mlp = MLP(config)
-
-    def __call__(self, x: jax.Array, *, train: bool) -> jax.Array:
-        x = x + self.attn(self.ln_1(x), train=train)
-        x = x + self.mlp(self.ln_2(x), train=train)
-        return x
-
-
-
 class GPT(nn.Module):
-    config: GPTConfig
 
-    def setup(self):
-        config = self.config
+    def __init__(self, config):
+        super().__init__()
         assert config.vocab_size is not None
         assert config.block_size is not None
+        self.config = config
 
-        self.wte = nn.Embed(config.vocab_size, config.n_embd)
-        self.wpe = nn.Embed(config.block_size, config.n_embd)
-        self.drop = nn.Dropout(config.dropout)
-        self.h = [Block(config) for _ in range(config.n_layer)]
-        self.ln_f = nn.LayerNorm()
-
-        #   weight-tying https://paperswithcode.com/method/weight-tying
-        #   is implemented using Embed.attend so lm_head is not needed
-        # self.lm_head = nn.Dense(config.vocab_size, use_bias=False)
-        # self.wte.weight = self.lm_head.weight 
+        self.transformer = nn.ModuleDict(dict(
+            wte = nn.Embedding(config.vocab_size, config.n_embd),
+            wpe = nn.Embedding(config.block_size, config.n_embd),
+            drop = nn.Dropout(config.dropout),
+            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+            ln_f = nn.LayerNorm(config.n_embd),
+        ))
+        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        # with weight tying when using torch.compile() some warnings get generated:
+        # "UserWarning: functional_call was passed multiple values for tied weights.
+        # This behavior is deprecated and will be an error in future versions"
+        # not 100% sure what this is, so far seems to be harmless. TODO investigate
+        self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
 
         # report number of parameters
-        # n_params = sum(p.numel() for p in self.parameters())
-        # print("number of parameters: %.2fM" % (n_params/1e6,))
+        n_params = sum(p.numel() for p in self.parameters())
+        print(f"number of parameters: {n_params:,}")
 
-    def __call__(self, idx: jax.Array, *, train: bool, targets: Optional[jax.Array]=None):
-        b, t = idx.shape
+    def forward(self, idx, targets=None):
+        device = idx.device
+        b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
-        pos = jnp.arange(0, t, dtype=jnp.int32)[None] # shape (1, t)
+        pos = torch.arange(0, t, dtype=torch.long, device=device).unsqueeze(0) # shape (1, t)
 
         # forward the GPT model itself
-        tok_emb = self.wte(idx) # token embeddings of shape (b, t, n_embd)
-        pos_emb = self.wpe(pos) # position embeddings of shape (1, t, n_embd)
-        x = self.drop(tok_emb + pos_emb, deterministic=not train)
-        for block in self.h:
-            x = block(x, train=train)
-        x = self.ln_f(x)
+        tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
+        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (1, t, n_embd)
+        x = self.transformer.drop(tok_emb + pos_emb)
+        for block in self.transformer.h:
+            x = block(x)
+        x = self.transformer.ln_f(x)
 
         if targets is not None:
             # if we are given some desired targets also calculate the loss
-            logits = self.wte.attend(x)
-            # loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
-            loss = optax.softmax_cross_entropy_with_integer_labels(
-                logits, targets).mean()
+            logits = self.lm_head(x)
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
-            logits = self.wte.attend(x[:, -1:, :]) # note: using list [-1] to preserve the time dim
+            logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
             loss = None
 
         return logits, loss
@@ -181,7 +181,7 @@ class GPT(nn.Module):
             config_args['dropout'] = override_args['dropout']
         # block_size is always 1024 for GPT model checkpoints
         # if one wants a lower block_size it has to be done through model surgery
-        # later, by calling crop_block_shape
+        # later, by calling crop_block_size()
 
         # create a from-scratch initialized minGPT model
         config = GPTConfig(block_size=1024, **config_args)
@@ -265,7 +265,7 @@ class GPT(nn.Module):
         optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas)
         return optimizer
 
-    # @torch.no_grad()
+    @torch.no_grad()
     def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
         """
         Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
