@@ -13,12 +13,12 @@ import os
 import time
 import math
 import pickle
-from typing import Tuple
-from flax.training import train_state
+from contextlib import nullcontext
 
 import numpy as np
-import jax
-import jax.numpy as jnp
+import torch
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.distributed import init_process_group, destroy_process_group
 
 from model import GPTConfig, GPT
 
@@ -68,19 +68,35 @@ exec(open('configurator.py').read()) # overrides from command line or config fil
 config = {k: globals()[k] for k in config_keys} # will be useful for logging
 # -----------------------------------------------------------------------------
 
+# various inits, derived attributes, I/O setup
+ddp = int(os.environ.get('LOCAL_RANK', -1)) != -1 # is this a ddp run?
+if ddp:
+    init_process_group(backend=backend)
+    gpu_id = int(os.environ["LOCAL_RANK"])
+    device = f"cuda:{gpu_id}"
+else:
+    gpu_id = 0 # gpu_id 0 means this is the (single) master process, basically
+
+if gpu_id == 0:
+    os.makedirs(out_dir, exist_ok=True)
+torch.manual_seed(1337 + gpu_id) # note: each worker gets a different seed
+torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
+torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
+device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.autocast
+# note: float16 would require us to change the code to use a GradScaler
+ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16}[dtype]
+ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
+
 # poor man's data loader, TODO evaluate need for actual DataLoader
 data_dir = os.path.join('data', dataset)
-# train_data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
-# val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
+train_data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
+val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
 def get_batch(split):
-    # data = train_data if split == 'train' else val_data
-    # ix = np.random.randint(len(data) - block_size, (batch_size,))
-    # x = np.stack([data[i:i+block_size].astype(np.int32) for i in ix])
-    # y = np.stack([data[i+1:i+1+block_size].astype(np.int32) for i in ix])
-    data = np.random.randint(0, block_size, size=(batch_size, 51), dtype=np.int32)
-    x = data[:, :-1]
-    y = data[:, 1:]
-    x, y = jax.device_put((x, y))
+    data = train_data if split == 'train' else val_data
+    ix = torch.randint(len(data) - block_size, (batch_size,))
+    x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
+    y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
+    x, y = x.to(device), y.to(device)
     return x, y
 
 # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
@@ -105,11 +121,7 @@ if init_from == 'scratch':
     print("Initializing a new model from scratch")
     gptconf = GPTConfig(**model_args)
     model = GPT(gptconf)
-    # initialize weights
-    variables = model.init(jax.random.PRNGKey(0), jnp.ones((1, 2), dtype=jnp.int32), train=False)
-    params = variables['params']
 elif init_from == 'resume':
-    raise RuntimeError("resuming not supported yet")
     print(f"Resuming training from {out_dir}")
     # resume training from a checkpoint.
     ckpt_path = os.path.join(out_dir, 'ckpt.pt')
@@ -131,7 +143,6 @@ elif init_from == 'resume':
     iter_num = checkpoint['iter_num']
     best_val_loss = checkpoint['best_val_loss']
 elif init_from.startswith('gpt2'):
-    raise RuntimeError(f"Initializing from GPT-2 weights not supported yet")
     print(f"Initializing from OpenAI GPT-2 weights: {init_from}")
     # initialize from OpenAI GPT-2 weights
     override_args = dict(dropout=dropout)
@@ -140,27 +151,25 @@ elif init_from.startswith('gpt2'):
     model_args['n_layer'] = model.config.n_layer
     model_args['n_head'] = model.config.n_head
     model_args['n_embd'] = model.config.n_embd
-else:
-    raise RuntimeError(f"init_from={init_from} not supported")
 # crop down the model block size if desired
 if block_size < model.config.block_size:
-    params = model.crop_block_size(params, block_size)
+    model.crop_block_size(block_size)
+model.to(device)
 
 # optimizer
-tx = model.configure_optimizers(params, weight_decay, learning_rate, (beta1, beta2))
-state = train_state.TrainState.create(
-    apply_fn=model.apply, params=params, tx=tx)
+optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2))
+if init_from == 'resume':
+    optimizer.load_state_dict(checkpoint['optimizer'])
 
-@jax.jit
-def train_step(state: train_state.TrainState, batch):
-    inputs, labels = batch
-    def loss_fn(params):
-        logits, loss = model.apply({'params': params}, inputs, train=True, targets=labels)
-        return loss
-    grad_fn = jax.value_and_grad(loss_fn)
-    loss, grad = grad_fn(state.params)
-    state = state.apply_gradients(grads=grad)
-    return loss, state
+# compile the model
+if compile:
+    print("compiling the model... (takes a ~minute)")
+    unoptimized_model = model
+    model = torch.compile(model) # requires PyTorch 2.0
+
+# wrap model into DDP container
+if ddp:
+    model = DDP(model, device_ids=[gpu_id])
 
 @torch.no_grad()
 def estimate_loss():
@@ -178,7 +187,6 @@ def estimate_loss():
     return out
 
 # learning rate decay scheduler (cosine with warmup)
-# TODO: create schedule with optax
 def get_lr(iter):
     # 1) linear warmup for warmup_iters steps
     if iter < warmup_iters:
@@ -189,7 +197,7 @@ def get_lr(iter):
     # 3) in between, use cosine decay down to min learning rate
     decay_ratio = (iter - warmup_iters) / (lr_decay_iters - warmup_iters)
     assert 0 <= decay_ratio <= 1
-    coeff = 0.5 * (1.0 + jnp.cos(jnp.pi * decay_ratio)) # coeff ranges 0..1
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff ranges 0..1
     return min_lr + coeff * (learning_rate - min_lr)
 
 # logging
@@ -204,7 +212,7 @@ while True:
     # determine the learning rate for this iteration
     if decay_lr:
         lr = get_lr(iter_num)
-        for param_group in tx.param_groups:
+        for param_group in optimizer.param_groups:
             param_group['lr'] = lr
     else:
         lr = learning_rate
@@ -225,7 +233,7 @@ while True:
             if iter_num > 0:
                 checkpoint = {
                     'model': raw_model.state_dict(),
-                    'optimizer': tx.state_dict(),
+                    'optimizer': optimizer.state_dict(),
                     'model_args': model_args,
                     'iter_num': iter_num,
                     'best_val_loss': best_val_loss,
@@ -240,10 +248,10 @@ while True:
     with ctx:
         logits, loss = model(X, Y)
 
-    tx.zero_grad(set_to_none=True)
+    optimizer.zero_grad(set_to_none=True)
     loss.backward()
     # TODO: gradient clipping evaluate need for
-    tx.step()
+    optimizer.step()
 
     t1 = time.time()
     dt = t1 - t0

@@ -9,12 +9,13 @@ https://github.com/huggingface/transformers/blob/main/src/transformers/models/gp
 
 import math
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Tuple
 
 import jax
 import jax.numpy as jnp
 import flax.linen as nn
 import optax
+from flax.traverse_util import path_aware_map
 
 @dataclass
 class GPTConfig:
@@ -115,16 +116,7 @@ class GPT(nn.Module):
         self.h = [Block(config) for _ in range(config.n_layer)]
         self.ln_f = nn.LayerNorm()
 
-        #   weight-tying https://paperswithcode.com/method/weight-tying
-        #   is implemented using Embed.attend so lm_head is not needed
-        # self.lm_head = nn.Dense(config.vocab_size, use_bias=False)
-        # self.wte.weight = self.lm_head.weight 
-
-        # report number of parameters
-        # n_params = sum(p.numel() for p in self.parameters())
-        # print("number of parameters: %.2fM" % (n_params/1e6,))
-
-    def __call__(self, idx: jax.Array, *, train: bool, targets: Optional[jax.Array]=None):
+    def __call__(self, idx: jax.Array, *, train: bool, targets: Optional[jax.Array] = None):
         b, t = idx.shape
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
         pos = jnp.arange(0, t, dtype=jnp.int32)[None] # shape (1, t)
@@ -150,15 +142,23 @@ class GPT(nn.Module):
 
         return logits, loss
 
-    def crop_block_size(self, block_size):
+    def crop_block_size(self, params, block_size: int):
         # model surgery to decrease the block size if necessary
         # e.g. we may load the GPT2 pretrained model checkpoint (block size 1024)
         # but want to use a smaller block size for some smaller, simpler model
+        
+
         assert block_size <= self.config.block_size
         self.config.block_size = block_size
-        self.transformer.wpe.weight = nn.Parameter(self.transformer.wpe.weight[:block_size])
-        for block in self.transformer.h:
-            block.attn.bias = block.attn.bias[:,:,:block_size,:block_size]
+
+        # self.transformer.wpe.weight = nn.Parameter(self.transformer.wpe.weight[:block_size])
+        def crop_weights(path: Tuple[str, ...], x):
+            if path[-2:] == ("wpe", "embedding"):
+                return x[:block_size]
+            return x
+
+        return path_aware_map(crop_weights, params)
+        
 
     @classmethod
     def from_pretrained(cls, model_type, override_args=None):
@@ -212,58 +212,33 @@ class GPT(nn.Module):
 
         return model
 
-    def configure_optimizers(self, weight_decay, learning_rate, betas):
+    def configure_optimizers(self, params, weight_decay, learning_rate, betas):
         """
         This long function is unfortunately doing something very simple and is being very defensive:
         We are separating out all parameters of the model into two buckets: those that will experience
         weight decay for regularization and those that won't (biases, and layernorm/embedding weights).
         We are then returning the PyTorch optimizer object.
         """
+        def get_optimizer(decay):
+            return optax.adamw(
+                learning_rate=learning_rate, b1=betas[0], b2=betas[1],
+                weight_decay=decay)
+        
+        def partition_fn(path: Tuple[str, ...], x) -> str:
+            if path[-1] in ('bias', 'scale', 'embedding'):
+                return 'no_decay'
+            elif path[-1] in ('kernel',):
+                return 'decay'
+            else:
+                raise ValueError(f"Unrecognized parameter: {path}")
 
-        # separate out all parameters to those that will and won't experience regularizing weight decay
-        decay = set()
-        no_decay = set()
-        whitelist_weight_modules = (torch.nn.Linear, )
-        blacklist_weight_modules = (torch.nn.LayerNorm, torch.nn.Embedding)
-        for mn, m in self.named_modules():
-            for pn, p in m.named_parameters():
-                fpn = '%s.%s' % (mn, pn) if mn else pn # full param name
-                # random note: because named_modules and named_parameters are recursive
-                # we will see the same tensors p many many times. but doing it this way
-                # allows us to know which parent module any tensor p belongs to...
-                if pn.endswith('bias'):
-                    # all biases will not be decayed
-                    no_decay.add(fpn)
-                elif pn.endswith('weight') and isinstance(m, whitelist_weight_modules):
-                    # weights of whitelist modules will be weight decayed
-                    decay.add(fpn)
-                elif pn.endswith('weight') and isinstance(m, blacklist_weight_modules):
-                    # weights of blacklist modules will NOT be weight decayed
-                    no_decay.add(fpn)
+        partition_optimizers = {    
+            'decay': get_optimizer(weight_decay), 
+            'no_decay': get_optimizer(0.0)}
+        param_partitions = path_aware_map(partition_fn, params)
+        tx = optax.multi_transform(partition_optimizers, param_partitions)
 
-        # subtle: 'transformer.wte.weight' and 'lm_head.weight' are tied, so they
-        # will appear in the no_decay and decay sets respectively after the above.
-        # In addition, because named_parameters() doesn't return duplicates, it
-        # will only return the first occurence, key'd by 'transformer.wte.weight', below.
-        # so let's manually remove 'lm_head.weight' from decay set. This will include
-        # this tensor into optimization via transformer.wte.weight only, and not decayed.
-        decay.remove('lm_head.weight')
-
-        # validate that we considered every parameter
-        param_dict = {pn: p for pn, p in self.named_parameters()}
-        inter_params = decay & no_decay
-        union_params = decay | no_decay
-        assert len(inter_params) == 0, "parameters %s made it into both decay/no_decay sets!" % (str(inter_params), )
-        assert len(param_dict.keys() - union_params) == 0, "parameters %s were not separated into either decay/no_decay set!" \
-                                                    % (str(param_dict.keys() - union_params), )
-
-        # create the pytorch optimizer object
-        optim_groups = [
-            {"params": [param_dict[pn] for pn in sorted(list(decay))], "weight_decay": weight_decay},
-            {"params": [param_dict[pn] for pn in sorted(list(no_decay))], "weight_decay": 0.0},
-        ]
-        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas)
-        return optimizer
+        return tx
 
     # @torch.no_grad()
     def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
