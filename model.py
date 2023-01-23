@@ -16,6 +16,7 @@ import jax.numpy as jnp
 import flax.linen as nn
 import optax
 from flax.traverse_util import path_aware_map
+from flax.core import freeze
 
 @dataclass
 class GPTConfig:
@@ -157,7 +158,7 @@ class GPT(nn.Module):
                 return x[:block_size]
             return x
 
-        return path_aware_map(crop_weights, params)
+        return freeze(path_aware_map(crop_weights, params))
         
 
     @classmethod
@@ -235,7 +236,7 @@ class GPT(nn.Module):
         partition_optimizers = {    
             'decay': get_optimizer(weight_decay), 
             'no_decay': get_optimizer(0.0)}
-        param_partitions = path_aware_map(partition_fn, params)
+        param_partitions = freeze(path_aware_map(partition_fn, params))
         tx = optax.multi_transform(partition_optimizers, param_partitions)
 
         return tx

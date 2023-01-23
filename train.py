@@ -1,3 +1,4 @@
+# %%
 """
 This training script can be run both on a single gpu in debug mode,
 and also in a larger training run with distributed data parallel (ddp).
@@ -15,12 +16,16 @@ import math
 import pickle
 from typing import Tuple
 from flax.training import train_state
-
+from functools import partial
 import numpy as np
 import jax
 import jax.numpy as jnp
+import optax
+import flax.training.checkpoints
+import orbax.checkpoint as orbax
 
 from model import GPTConfig, GPT
+from utils import print_compiling
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
@@ -37,7 +42,7 @@ wandb_log = False # disabled by default
 wandb_project = 'owt'
 wandb_run_name = 'gpt2' # 'run' + str(time.time())
 # data
-dataset = 'openwebtext'
+dataset = 'shakespeare'
 batch_size = 12
 block_size = 1024
 # model
@@ -70,17 +75,20 @@ config = {k: globals()[k] for k in config_keys} # will be useful for logging
 
 # poor man's data loader, TODO evaluate need for actual DataLoader
 data_dir = os.path.join('data', dataset)
-# train_data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
-# val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
+train_data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
+val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
 def get_batch(split):
-    # data = train_data if split == 'train' else val_data
-    # ix = np.random.randint(len(data) - block_size, (batch_size,))
-    # x = np.stack([data[i:i+block_size].astype(np.int32) for i in ix])
-    # y = np.stack([data[i+1:i+1+block_size].astype(np.int32) for i in ix])
-    data = np.random.randint(0, block_size, size=(batch_size, 51), dtype=np.int32)
-    x = data[:, :-1]
-    y = data[:, 1:]
-    x, y = jax.device_put((x, y))
+    data = train_data if split == 'train' else val_data
+    ix = np.random.randint(len(data) - block_size, size=(batch_size,))
+    x = np.stack([data[i:i+block_size].astype(np.int32) for i in ix])
+    y = np.stack([data[i+1:i+1+block_size].astype(np.int32) for i in ix])
+
+    # random samples
+    # data = np.random.randint(0, block_size, size=(batch_size, 51), dtype=np.int32)
+    # x = data[:, :-1]
+    # y = data[:, 1:]
+    # x, y = jax.device_put((x, y))
+
     return x, y
 
 # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
@@ -146,109 +154,106 @@ else:
 if block_size < model.config.block_size:
     params = model.crop_block_size(params, block_size)
 
+# learning rate decay scheduler (cosine with warmup)
+if decay_lr:
+    lr_schedule = optax.warmup_cosine_decay_schedule(
+        init_value=0.0, peak_value=learning_rate,
+        warmup_steps=warmup_iters, decay_steps=lr_decay_iters,
+        end_value=min_lr,
+    )
+else:
+    lr_schedule = learning_rate
+
+# %%
 # optimizer
-tx = model.configure_optimizers(params, weight_decay, learning_rate, (beta1, beta2))
+tx = model.configure_optimizers(params, weight_decay, lr_schedule, (beta1, beta2))
 state = train_state.TrainState.create(
     apply_fn=model.apply, params=params, tx=tx)
 
-@jax.jit
-def train_step(state: train_state.TrainState, batch):
+# %%
+@partial(jax.jit, static_argnames=('train',))
+@print_compiling
+def forward(state, batch, *, train: bool):
     inputs, labels = batch
+    rngs = {}
+    if train and dropout > 0.0:
+        rngs['dropout'] = jax.random.fold_in(
+            jax.random.PRNGKey(0), state.step)
+    return state.apply_fn(
+        {'params': state.params}, 
+         inputs, train=train, targets=labels, rngs=rngs)
+
+@partial(jax.jit, donate_argnums=(0,))
+@print_compiling
+def train_step(state: train_state.TrainState, batch):
     def loss_fn(params):
-        logits, loss = model.apply({'params': params}, inputs, train=True, targets=labels)
+        state_ = state.replace(params=params)
+        logits, loss = forward(state_, batch, train=True)
         return loss
     grad_fn = jax.value_and_grad(loss_fn)
     loss, grad = grad_fn(state.params)
     state = state.apply_gradients(grads=grad)
     return loss, state
 
-@torch.no_grad()
 def estimate_loss():
     out = {}
-    model.eval()
     for split in ['train', 'val']:
-        losses = torch.zeros(eval_iters)
+        losses = np.zeros(eval_iters)
         for k in range(eval_iters):
-            X, Y = get_batch(split)
-            with ctx:
-                logits, loss = model(X, Y)
-            losses[k] = loss.item()
+            batch = get_batch(split)
+            logits, loss = forward(state, batch, train=False)
+            losses[k] = float(loss)
         out[split] = losses.mean()
-    model.train()
     return out
 
-# learning rate decay scheduler (cosine with warmup)
-# TODO: create schedule with optax
-def get_lr(iter):
-    # 1) linear warmup for warmup_iters steps
-    if iter < warmup_iters:
-        return learning_rate * iter / warmup_iters
-    # 2) if iter > lr_decay_iters, return min learning rate
-    if iter > lr_decay_iters:
-        return min_lr
-    # 3) in between, use cosine decay down to min learning rate
-    decay_ratio = (iter - warmup_iters) / (lr_decay_iters - warmup_iters)
-    assert 0 <= decay_ratio <= 1
-    coeff = 0.5 * (1.0 + jnp.cos(jnp.pi * decay_ratio)) # coeff ranges 0..1
-    return min_lr + coeff * (learning_rate - min_lr)
 
 # logging
-if wandb_log and gpu_id == 0:
+if wandb_log:
     import wandb
     wandb.init(project=wandb_project, name=wandb_run_name, config=config)
 
+# %%
+
 # training loop
 t0 = time.time()
+checkpointer = orbax.Checkpointer(orbax.PyTreeCheckpointHandler())
 while True:
-
-    # determine the learning rate for this iteration
-    if decay_lr:
-        lr = get_lr(iter_num)
-        for param_group in tx.param_groups:
-            param_group['lr'] = lr
-    else:
-        lr = learning_rate
-
-    if iter_num % eval_interval == 0 and gpu_id == 0:
+    if iter_num % eval_interval == 0:
+        print("evaluating...")
         losses = estimate_loss()
         print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
         if wandb_log:
             wandb.log({
                 "iter": iter_num,
-                "train/loss": losses['train'],
-                "val/loss": losses['val'],
-                "lr": lr,
+                "loss/train": losses['train'],
+                "loss/val": losses['val'],
+                "lr": float(lr_schedule(iter_num)) if callable(lr_schedule) else lr_schedule,
             })
         if losses['val'] < best_val_loss or always_save_checkpoint:
             best_val_loss = losses['val']
-            raw_model = model.module if ddp else model
             if iter_num > 0:
-                checkpoint = {
-                    'model': raw_model.state_dict(),
-                    'optimizer': tx.state_dict(),
-                    'model_args': model_args,
-                    'iter_num': iter_num,
-                    'best_val_loss': best_val_loss,
-                    'config': config,
-                }
                 print(f"saving checkpoint to {out_dir}")
-                torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
+                flax.training.checkpoints.save_checkpoint(
+                    ckpt_dir=os.path.join(out_dir, 'checkpoint'),
+                    target={
+                        'state': state,
+                        'model_args': model_args,
+                        'iter_num': iter_num,
+                        'best_val_loss': best_val_loss,
+                        'config': config,
+                    },
+                    step=iter_num,
+                    orbax_checkpointer=checkpointer,
+                )
     if iter_num == 0 and eval_only:
         break
 
-    X, Y = get_batch('train')
-    with ctx:
-        logits, loss = model(X, Y)
-
-    tx.zero_grad(set_to_none=True)
-    loss.backward()
-    # TODO: gradient clipping evaluate need for
-    tx.step()
+    loss, state = train_step(state, get_batch('train'))
 
     t1 = time.time()
     dt = t1 - t0
     t0 = t1
-    if iter_num % log_interval == 0 and gpu_id == 0:
+    if iter_num % log_interval == 0:
         lossf = loss.item() # loss as float. TODO CPU-GPU sync: profile, make sure not slow af
         print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms")
     iter_num += 1
@@ -256,6 +261,3 @@ while True:
     # termination conditions
     if iter_num > max_iters:
         break
-
-if ddp:
-    destroy_process_group()
