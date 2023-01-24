@@ -206,6 +206,11 @@ def estimate_loss():
         out[split] = losses.mean()
     return out
 
+@jax.jit
+@print_compiling
+def sample(state, key, tokens):
+    return model.generate(key, state.params, tokens, max_new_tokens=10)
+
 
 # logging
 if wandb_log:
@@ -213,13 +218,14 @@ if wandb_log:
     wandb.init(project=wandb_project, name=wandb_run_name, config=config)
 
 # %%
-
+val_batch = get_batch('val')
 # training loop
 t0 = time.time()
 checkpointer = orbax.Checkpointer(orbax.PyTreeCheckpointHandler())
 while True:
     if iter_num % eval_interval == 0:
         print("evaluating...")
+        tokens = sample(state, jax.random.PRNGKey(0), tokens=val_batch[0][0:1,:5])
         losses = estimate_loss()
         print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
         if wandb_log:
