@@ -54,8 +54,7 @@ class CausalSelfAttention(nn.Module):
         c_attn = c_attn.swapaxes(1, 2) # (B, nh, T, 3 * hs)
         q, k, v = jnp.split(c_attn, 3, axis=-1) # (B, nh, T, hs)
 
-        with jax.ensure_compile_time_eval():
-            mask = jnp.tril(jnp.ones((T, T))).reshape((1, 1, T, T))
+        mask = jnp.tril(jnp.ones((T, T))).reshape((1, 1, T, T))
         
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         att = (q @ k.swapaxes(-2, -1)) * (1.0 / jnp.sqrt(k.shape[-1]))
@@ -130,15 +129,13 @@ class GPT(nn.Module):
             x = block(x, train=train)
         x = self.ln_f(x)
 
+        logits = self.wte.attend(x)
+
         if targets is not None:
             # if we are given some desired targets also calculate the loss
-            logits = self.wte.attend(x)
-            # loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
             loss = optax.softmax_cross_entropy_with_integer_labels(
                 logits, targets).mean()
         else:
-            # inference-time mini-optimization: only forward the lm_head on the very last position
-            logits = self.wte.attend(x[:, -1:, :]) # note: using list [-1] to preserve the time dim
             loss = None
 
         return logits, loss
@@ -249,34 +246,33 @@ class GPT(nn.Module):
         Most likely you'll want to make sure to be in model.eval() mode of operation for this.
         """
         B, T = input_tokens.shape
-        tokens = jnp.zeros((B, T + max_new_tokens), dtype=jnp.int32)
-        # tokens[:, :T] = idx
-        tokens = tokens.at[:, :T].set(input_tokens)
-        keys = jax.random.split(key, max_new_tokens)
+        padding = jnp.zeros((B, max_new_tokens), dtype=jnp.int32)
+        tokens = jnp.concatenate([input_tokens, padding], axis=-1)
         indexes = jnp.arange(T, T + max_new_tokens)
 
         # tokens index -> tokens None
-        def scan_f(tokens, inputs):
-            i, key = inputs
+        def scan_f(tokens, i):
+            # l: x y
+            # t: a b - -
+            # i: 0 1 2 3
+            step_key = jax.random.fold_in(key, i)
             # if the sequence context is growing too long we must crop it at block_size
             # idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
             # forward the model to get the logits for the index in the sequence
             logits, _ = self.apply({'params': params}, tokens, train=False)
             # pluck the logits at the final step and scale by desired temperature
-            logits = logits[:, i, :] / temperature
+            logits = logits[:, i - 1, :] / temperature
             # optionally crop the logits to only the top k options
             if top_k is not None:
                 v, _ = jax.lax.top_k(logits, min(top_k, logits.shape[-1]))
-                logits = logits.at[logits < v[:, -1:]].set(-float('inf'))
-            # apply softmax to convert logits to (normalized) probabilities
-            probs = nn.softmax(logits, axis=-1)
+                logits = jnp.where(logits < v[:, -1:], float('-inf'), logits)
             # sample from the distribution
-            next_token = jax.random.categorical(key, probs, axis=-1)
+            next_token = jax.random.categorical(step_key, logits, axis=-1)
             # append sampled index to the running sequence and continue
             tokens = tokens.at[:, i].set(next_token)
 
             return tokens, None
 
-        tokens, _ = jax.lax.scan(scan_f, tokens, (indexes, keys))
+        tokens, _ = jax.lax.scan(scan_f, tokens, indexes)
 
         return tokens

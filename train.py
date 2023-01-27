@@ -23,6 +23,7 @@ import jax.numpy as jnp
 import optax
 import flax.training.checkpoints
 import orbax.checkpoint as orbax
+import tiktoken
 
 from model import GPTConfig, GPT
 from utils import print_compiling
@@ -208,8 +209,14 @@ def estimate_loss():
 
 @jax.jit
 @print_compiling
-def sample(state, key, tokens):
-    return model.generate(key, state.params, tokens, max_new_tokens=10)
+def _sample(params, key, tokens) -> jax.Array:
+    return model.generate(key, params, tokens, max_new_tokens=10)
+
+tokenizer = tiktoken.get_encoding("gpt2")
+
+def sample(params, key, tokens) -> str:
+    tokens = _sample(params, key, tokens)
+    return tokenizer.decode(tokens[0])
 
 
 # logging
@@ -225,7 +232,8 @@ checkpointer = orbax.Checkpointer(orbax.PyTreeCheckpointHandler())
 while True:
     if iter_num % eval_interval == 0:
         print("evaluating...")
-        tokens = sample(state, jax.random.PRNGKey(0), tokens=val_batch[0][0:1,:5])
+        sample_str = sample(state.params, jax.random.PRNGKey(0), tokens=val_batch[0][0:1,:5])
+        print(f"sample: {sample_str}")
         losses = estimate_loss()
         print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
         if wandb_log:
