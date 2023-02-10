@@ -6,10 +6,10 @@ import pickle
 import tiktoken
 from model import GPTConfig, GPT
 from pathlib import Path
-from flax.training import checkpoints
 from flax import serialization
 import jax.numpy as jnp
 import jax
+import orbax.checkpoint as orbax
 
 from utils import print_compiling
 
@@ -25,10 +25,16 @@ dtype = 'bfloat16' # 'float32' or 'bfloat16' or 'float16'
 compile = False # use PyTorch 2.0 to compile the model to be faster
 exec(open('configurator.py').read()) # overrides from command line or config file
 # -----------------------------------------------------------------------------
+checkpoint_path = Path(out_dir, 'checkpoint')
+checkpoint_manager = orbax.CheckpointManager(
+    checkpoint_path,
+    checkpointers=orbax.Checkpointer(orbax.PyTreeCheckpointHandler()),
+)
+latest_step = checkpoint_manager.latest_step()
+assert latest_step is not None, "No checkpoint found in out_dir!"
 
 # model
-ckpt_path = Path(out_dir, 'checkpoint')
-checkpoint = checkpoints.restore_checkpoint(ckpt_path, target=None)
+checkpoint = checkpoint_manager.restore(latest_step, items=None)
 gptconf = GPTConfig(**checkpoint['model_args'])
 model = GPT(gptconf)
 params = checkpoint['state']['params']
@@ -61,7 +67,8 @@ key = jax.random.PRNGKey(seed)
 @jax.jit
 @print_compiling
 def _sample(params, key, tokens) -> jax.Array:
-    return model.generate(key, params, tokens, max_new_tokens=10)
+    return model.generate(
+        key, params, tokens, max_new_tokens=max_new_tokens, top_k=top_k, temperature=temperature)
 
 def sample(params, key, tokens) -> str:
     tokens = _sample(params, key, tokens)

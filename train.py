@@ -11,6 +11,7 @@ $ torchrun --standalone --nproc_per_node=4 train.py
 """
 
 import os
+from pathlib import Path
 import time
 import math
 import pickle
@@ -70,13 +71,27 @@ backend = 'nccl' # 'nccl', 'gloo', etc.
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1', etc.
 dtype = 'bfloat16' # 'float32' or 'bfloat16'
 compile = True # use PyTorch 2.0 to compile the model to be faster
+# sampling
+max_new_tokens = 100 # number of tokens generated in each sample
+temperature = 0.8 # higher temperature (up to 1) is more random, lower (down to 0) means more greedy
+top_k = 200 # retain only the top_k most likely tokens, clamp others to have 0 probability
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open('configurator.py').read()) # overrides from command line or config file
 config = {k: globals()[k] for k in config_keys} # will be useful for logging
 # -----------------------------------------------------------------------------
-checkpoint_path = os.path.join(out_dir, 'checkpoint')
-
+checkpoint_path = Path(out_dir, 'checkpoint')
+checkpoint_manager = orbax.CheckpointManager(
+    checkpoint_path,
+    checkpointers=orbax.Checkpointer(orbax.PyTreeCheckpointHandler()),
+    options=orbax.CheckpointManagerOptions(
+        max_to_keep=2,
+        # best_fn=lambda c: c['val_loss'],
+        # best_mode='min',
+        keep_checkpoints_without_metrics=False,
+        create=True,
+    ),
+)
 # poor man's data loader, TODO evaluate need for actual DataLoader
 data_dir = os.path.join('data', dataset)
 train_data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
@@ -86,13 +101,6 @@ def get_batch(split):
     ix = np.random.randint(len(data) - block_size, size=(batch_size,))
     x = np.stack([data[i:i+block_size].astype(np.int32) for i in ix])
     y = np.stack([data[i+1:i+1+block_size].astype(np.int32) for i in ix])
-
-    # random samples
-    # data = np.random.randint(0, block_size, size=(batch_size, 51), dtype=np.int32)
-    # x = data[:, :-1]
-    # y = data[:, 1:]
-    # x, y = jax.device_put((x, y))
-
     return x, y
 
 # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
@@ -121,10 +129,11 @@ if init_from == 'scratch':
     state = model.create_state(**config)
     params = state.params
 elif init_from == 'resume':
-    # raise RuntimeError("resuming not supported yet")
     print(f"Resuming training from {out_dir}")
     # resume training from a checkpoint.
-    checkpoint = checkpoints.restore_checkpoint(checkpoint_path, target=None)
+    latest_step = checkpoint_manager.latest_step()
+    assert latest_step is not None, "no checkpoint found"
+    checkpoint = checkpoint_manager.restore(latest_step, items=None)
     checkpoint_model_args = checkpoint['model_args']
     for k, v in model_args.items():
         assert checkpoint_model_args[k] == v, "for now"
@@ -134,13 +143,13 @@ elif init_from == 'resume':
     empty_state = jax.eval_shape(lambda: model.create_state(**config))
     state = serialization.from_state_dict(empty_state, checkpoint['state'])
     iter_num = checkpoint['iter_num'] + 1
-    best_val_loss = checkpoint['best_val_loss']
+    best_val_loss = checkpoint['val_loss']
 elif init_from.startswith('gpt2'):
     print(f"Initializing from OpenAI GPT-2 weights: {init_from}")
     # initialize from OpenAI GPT-2 weights
     override_args = dict(dropout=dropout)
     model, params = GPT.from_pretrained(init_from, override_args)
-    state = model.create_state(**config)
+    state = model.create_state(**config, params=params)
     # read off and override the GPT sizing model args from the model config
     model_args['n_layer'] = model.config.n_layer
     model_args['n_head'] = model.config.n_head
@@ -187,7 +196,8 @@ def estimate_loss():
 @jax.jit
 @print_compiling
 def _sample(params, key, tokens) -> jax.Array:
-    return model.generate(key, params, tokens, max_new_tokens=10)
+    return model.generate(
+        key, params, tokens, max_new_tokens=max_new_tokens, top_k=top_k, temperature=temperature)
 
 tokenizer = tiktoken.get_encoding("gpt2")
 
@@ -204,7 +214,7 @@ if wandb_log:
 val_batch = get_batch('val')
 # training loop
 t0 = time.time()
-checkpointer = orbax.Checkpointer(orbax.PyTreeCheckpointHandler())
+
 while True:
     if iter_num % eval_interval == 0:
         print("evaluating...")
@@ -219,22 +229,22 @@ while True:
                 "loss/val": losses['val'],
                 "lr": float(lr_schedule(iter_num)) if callable(lr_schedule) else lr_schedule,
             })
-        if losses['val'] < best_val_loss or always_save_checkpoint:
-            best_val_loss = losses['val']
-            if iter_num > 0:
-                print(f"saving checkpoint to {out_dir}")
-                checkpoints.save_checkpoint(
-                    os.path.join(out_dir, 'checkpoint'),
-                    {
-                        'state': state,
-                        'model_args': model_args,
-                        'iter_num': iter_num,
-                        'best_val_loss': best_val_loss,
-                        'config': config,
-                    },
-                    step=iter_num,
-                    orbax_checkpointer=checkpointer,
-                )
+        if iter_num > 0:
+            print(f"saving checkpoint to {out_dir}")
+            checkpoint = {
+                'state': state,
+                'model_args': model_args,
+                'iter_num': iter_num,
+                'val_loss': losses['val'],
+                'config': config,
+            }
+            checkpoint_manager.save(
+                step=iter_num,
+                items=checkpoint,
+                save_kwargs=dict(
+                    save_args=orbax_utils.save_args_from_target(checkpoint)
+                ),
+            )
     if iter_num == 0 and eval_only:
         break
 

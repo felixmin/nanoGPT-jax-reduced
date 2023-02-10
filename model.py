@@ -231,7 +231,7 @@ class GPT(nn.Module):
         copy_from('ln_f.scale', 'transformer.ln_f.weight')
         copy_from('ln_f.bias', 'transformer.ln_f.bias')
 
-        params = traverse_util.unflatten_dict(flat_params, sep='.')
+        params = freeze(traverse_util.unflatten_dict(flat_params, sep='.'))
 
         return model, params
 
