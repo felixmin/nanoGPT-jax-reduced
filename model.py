@@ -54,21 +54,19 @@ class CausalSelfAttention(nn.Module):
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
         q, k ,v  = self.c_attn(x).split(3, axis=-1)
-        k = k.reshape(B, T, self.n_head, C // self.n_head).swapaxes(1, 2) # (B, nh, T, hs)
         q = q.reshape(B, T, self.n_head, C // self.n_head).swapaxes(1, 2) # (B, nh, T, hs)
+        k = k.reshape(B, T, self.n_head, C // self.n_head).swapaxes(1, 2) # (B, nh, T, hs)
         v = v.reshape(B, T, self.n_head, C // self.n_head).swapaxes(1, 2) # (B, nh, T, hs)
 
         mask = jnp.tril(jnp.ones((T, T))).reshape((1, 1, T, T))
         
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         att = (q @ k.swapaxes(-2, -1)) * (1.0 / jnp.sqrt(k.shape[-1]))
-        # att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
         att = jnp.where(mask == 0, float('-inf'), att)
         att = nn.softmax(att, axis=-1)
         att = self.attn_dropout(att, deterministic=not train)
         y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
         y = y.swapaxes(1, 2).reshape(B, T, C) # re-assemble all head outputs side by side
-
         # output projection
         y = self.resid_dropout(self.c_proj(y), deterministic=not train)
         return y
@@ -94,16 +92,15 @@ class Block(nn.Module):
 
     def setup(self):
         config = self.config
-        self.ln_1 = nn.LayerNorm()
+        self.ln_1 = nn.LayerNorm(epsilon=1e-5)
         self.attn = CausalSelfAttention(config)
-        self.ln_2 = nn.LayerNorm()
+        self.ln_2 = nn.LayerNorm(epsilon=1e-5)
         self.mlp = MLP(config)
 
     def __call__(self, x: jax.Array, *, train: bool) -> jax.Array:
         x = x + self.attn(self.ln_1(x), train=train)
         x = x + self.mlp(self.ln_2(x), train=train)
         return x
-
 
 
 class GPT(nn.Module):
@@ -222,7 +219,7 @@ class GPT(nn.Module):
             copy_from(f'h_{i}.ln_1.bias', f'transformer.h.{i}.ln_1.bias')
             copy_from(f'h_{i}.attn.c_attn.kernel', f'transformer.h.{i}.attn.c_attn.weight', add_head_dim=True)
             copy_from(f'h_{i}.attn.c_attn.bias', f'transformer.h.{i}.attn.c_attn.bias', add_head_dim=True)
-            copy_from(f'h_{i}.attn.c_proj.kernel', f'transformer.h.{i}.attn.c_proj.weight', transpose=True)
+            copy_from(f'h_{i}.attn.c_proj.kernel', f'transformer.h.{i}.attn.c_proj.weight')
             copy_from(f'h_{i}.attn.c_proj.bias', f'transformer.h.{i}.attn.c_proj.bias')
             copy_from(f'h_{i}.ln_2.scale', f'transformer.h.{i}.ln_2.weight')
             copy_from(f'h_{i}.ln_2.bias', f'transformer.h.{i}.ln_2.bias')
