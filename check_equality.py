@@ -1,15 +1,9 @@
 """
 Sample from a trained model
 """
-import os
-import pickle
-import optax
 import tiktoken
-from model import GPTConfig, GPT
+from model import GPT
 from model_pt import GPT as GPT_PT
-from pathlib import Path
-from flax.training import checkpoints, train_state
-from flax import serialization
 import jax.numpy as jnp
 import jax
 import torch

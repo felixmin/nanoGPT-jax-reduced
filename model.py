@@ -307,7 +307,7 @@ class GPT(nn.Module):
     
     def create_state(
         self, learning_rate, weight_decay, beta1, beta2, 
-        warmup_iters, lr_decay_iters, decay_lr, min_lr,
+        decay_lr=None, warmup_iters=None, lr_decay_iters=None, min_lr=None,
         params=None,
         **kwargs
     ):
@@ -315,6 +315,7 @@ class GPT(nn.Module):
             variables = self.init(jax.random.PRNGKey(0), jnp.ones((1, 1), dtype=jnp.int32), train=False)
             params = variables['params']
         if decay_lr:
+            assert warmup_iters is not None and lr_decay_iters is not None and min_lr is not None
             lr_schedule = optax.warmup_cosine_decay_schedule(
                 init_value=0.0, peak_value=learning_rate,
                 warmup_steps=warmup_iters, decay_steps=lr_decay_iters,
