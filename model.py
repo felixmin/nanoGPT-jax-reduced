@@ -14,9 +14,12 @@ from typing import Optional, Tuple
 import jax
 import jax.numpy as jnp
 import flax.linen as nn
+import numpy as np
 import optax
 from flax.traverse_util import path_aware_map
 from flax.core import freeze
+from flax.training import train_state
+from flax import traverse_util
 
 @dataclass
 class GPTConfig:
@@ -36,7 +39,7 @@ class CausalSelfAttention(nn.Module):
         assert config.n_embd % config.n_head == 0
         head_size = config.n_embd // config.n_head
         # key, query, value projections for all heads, but in a batch
-        self.c_attn = nn.DenseGeneral((config.n_head, 3 * head_size))
+        self.c_attn = nn.Dense(config.n_embd * 3)
         # output projection
         self.c_proj = nn.Dense(config.n_embd)
         # regularization
@@ -50,9 +53,10 @@ class CausalSelfAttention(nn.Module):
         B, T, C = x.shape # batch size, sequence length, embedding dimensionality (n_embd)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        c_attn = self.c_attn(x) # (B, T, hs, 3 * hs)
-        c_attn = c_attn.swapaxes(1, 2) # (B, nh, T, 3 * hs)
-        q, k, v = jnp.split(c_attn, 3, axis=-1) # (B, nh, T, hs)
+        q, k ,v  = self.c_attn(x).split(3, axis=-1)
+        k = k.reshape(B, T, self.n_head, C // self.n_head).swapaxes(1, 2) # (B, nh, T, hs)
+        q = q.reshape(B, T, self.n_head, C // self.n_head).swapaxes(1, 2) # (B, nh, T, hs)
+        v = v.reshape(B, T, self.n_head, C // self.n_head).swapaxes(1, 2) # (B, nh, T, hs)
 
         mask = jnp.tril(jnp.ones((T, T))).reshape((1, 1, T, T))
         
@@ -184,31 +188,55 @@ class GPT(nn.Module):
         # create a from-scratch initialized minGPT model
         config = GPTConfig(block_size=1024, **config_args)
         model = GPT(config)
-        sd = model.state_dict()
+        variables = jax.eval_shape(lambda: model.init(
+            jax.random.PRNGKey(0), jnp.ones((1, 1), dtype=jnp.int32), train=False))
+        params = variables['params']
+        flat_params = traverse_util.flatten_dict(params, sep='.')
+        
 
         # init a huggingface/transformers model
         model_hf = GPT2LMHeadModel.from_pretrained(model_type)
         sd_hf = model_hf.state_dict()
 
-        # copy while ensuring all of the parameters are aligned and match in names and shapes
-        keys = [k for k in sd_hf if not k.endswith('attn.masked_bias')] # ignore these
-        transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
-        # basically the openai checkpoints use a "Conv1D" module, but we only want to use a vanilla Linear
-        # this means that we have to transpose these weights when we import them
-        assert len(keys) == len(sd)
-        for k in keys:
-            if any(k.endswith(w) for w in transposed):
-                # special treatment for the Conv1D weights we need to transpose
-                assert sd_hf[k].shape[::-1] == sd[k].shape
-                with torch.no_grad():
-                    sd[k].copy_(sd_hf[k].t())
-            else:
-                # vanilla copy over the other parameters
-                assert sd_hf[k].shape == sd[k].shape
-                with torch.no_grad():
-                    sd[k].copy_(sd_hf[k])
+        def copy_from(flax_name, pt_name, transpose=False, add_head_dim=False):
+            pt_tensor = sd_hf[pt_name]
+            jax_array = flat_params[flax_name]
+            if transpose:
+                pt_tensor = pt_tensor.t()
+            pt_array = pt_tensor.detach().cpu().numpy()
 
-        return model
+            if add_head_dim:
+                # pt_array = pt_array.reshape(*pt_array.shape[:-1], config.n_head, -1, 3)
+                pass
+
+            assert pt_array.shape == jax_array.shape
+
+            flat_params[flax_name] = pt_array
+
+        # transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
+        copy_from('wte.embedding', 'transformer.wte.weight')
+        copy_from('wpe.embedding', 'transformer.wpe.weight')
+
+        for i in range(config.n_layer):
+            copy_from(f'h_{i}.ln_1.scale', f'transformer.h.{i}.ln_1.weight')
+            copy_from(f'h_{i}.ln_1.bias', f'transformer.h.{i}.ln_1.bias')
+            copy_from(f'h_{i}.attn.c_attn.kernel', f'transformer.h.{i}.attn.c_attn.weight', add_head_dim=True)
+            copy_from(f'h_{i}.attn.c_attn.bias', f'transformer.h.{i}.attn.c_attn.bias', add_head_dim=True)
+            copy_from(f'h_{i}.attn.c_proj.kernel', f'transformer.h.{i}.attn.c_proj.weight', transpose=True)
+            copy_from(f'h_{i}.attn.c_proj.bias', f'transformer.h.{i}.attn.c_proj.bias')
+            copy_from(f'h_{i}.ln_2.scale', f'transformer.h.{i}.ln_2.weight')
+            copy_from(f'h_{i}.ln_2.bias', f'transformer.h.{i}.ln_2.bias')
+            copy_from(f'h_{i}.mlp.c_fc.kernel', f'transformer.h.{i}.mlp.c_fc.weight')
+            copy_from(f'h_{i}.mlp.c_fc.bias', f'transformer.h.{i}.mlp.c_fc.bias')
+            copy_from(f'h_{i}.mlp.c_proj.kernel', f'transformer.h.{i}.mlp.c_proj.weight')
+            copy_from(f'h_{i}.mlp.c_proj.bias', f'transformer.h.{i}.mlp.c_proj.bias')
+
+        copy_from('ln_f.scale', 'transformer.ln_f.weight')
+        copy_from('ln_f.bias', 'transformer.ln_f.bias')
+
+        params = traverse_util.unflatten_dict(flat_params, sep='.')
+
+        return model, params
 
     def configure_optimizers(self, params, weight_decay, learning_rate, betas):
         """
@@ -263,11 +291,14 @@ class GPT(nn.Module):
             # pluck the logits at the final step and scale by desired temperature
             logits = logits[:, i - 1, :] / temperature
             # optionally crop the logits to only the top k options
-            if top_k is not None:
-                v, _ = jax.lax.top_k(logits, min(top_k, logits.shape[-1]))
-                logits = jnp.where(logits < v[:, -1:], float('-inf'), logits)
             # sample from the distribution
-            next_token = jax.random.categorical(step_key, logits, axis=-1)
+            if top_k is not None:
+                top_logits, top_tokens = jax.lax.top_k(logits, min(top_k, logits.shape[-1]))
+                token_idx = jax.random.categorical(step_key, top_logits, axis=-1)
+                next_token = jnp.take_along_axis(top_tokens, token_idx[:, None], axis=-1).squeeze(-1)
+            else:
+                next_token = jax.random.categorical(step_key, logits, axis=-1)
+                # logits = jnp.where(logits < v[:, -1:], float('-inf'), logits)
             # append sampled index to the running sequence and continue
             tokens = tokens.at[:, i].set(next_token)
 
@@ -276,3 +307,25 @@ class GPT(nn.Module):
         tokens, _ = jax.lax.scan(scan_f, tokens, indexes)
 
         return tokens
+    
+    def create_state(
+        self, learning_rate, weight_decay, beta1, beta2, 
+        warmup_iters, lr_decay_iters, decay_lr, min_lr,
+        params=None,
+        **kwargs
+    ):
+        if params is None:
+            variables = self.init(jax.random.PRNGKey(0), jnp.ones((1, 1), dtype=jnp.int32), train=False)
+            params = variables['params']
+        if decay_lr:
+            lr_schedule = optax.warmup_cosine_decay_schedule(
+                init_value=0.0, peak_value=learning_rate,
+                warmup_steps=warmup_iters, decay_steps=lr_decay_iters,
+                end_value=min_lr,
+            )
+        else:
+            lr_schedule = learning_rate
+        tx = self.configure_optimizers(
+            params, weight_decay=weight_decay, learning_rate=lr_schedule,
+            betas=(beta1, beta2))
+        return train_state.TrainState.create(apply_fn=self.apply, params=params, tx=tx)

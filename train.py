@@ -21,9 +21,11 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 import optax
-import flax.training.checkpoints
+from flax.training import checkpoints
+from flax import serialization
 import orbax.checkpoint as orbax
 import tiktoken
+from flax.training import orbax_utils
 
 from model import GPTConfig, GPT
 from utils import print_compiling
@@ -73,6 +75,7 @@ config_keys = [k for k,v in globals().items() if not k.startswith('_') and isins
 exec(open('configurator.py').read()) # overrides from command line or config file
 config = {k: globals()[k] for k in config_keys} # will be useful for logging
 # -----------------------------------------------------------------------------
+checkpoint_path = os.path.join(out_dir, 'checkpoint')
 
 # poor man's data loader, TODO evaluate need for actual DataLoader
 data_dir = os.path.join('data', dataset)
@@ -115,61 +118,35 @@ if init_from == 'scratch':
     gptconf = GPTConfig(**model_args)
     model = GPT(gptconf)
     # initialize weights
-    variables = model.init(jax.random.PRNGKey(0), jnp.ones((1, 2), dtype=jnp.int32), train=False)
-    params = variables['params']
+    state = model.create_state(**config)
+    params = state.params
 elif init_from == 'resume':
-    raise RuntimeError("resuming not supported yet")
+    # raise RuntimeError("resuming not supported yet")
     print(f"Resuming training from {out_dir}")
     # resume training from a checkpoint.
-    ckpt_path = os.path.join(out_dir, 'ckpt.pt')
-    checkpoint = torch.load(ckpt_path, map_location=device)
+    checkpoint = checkpoints.restore_checkpoint(checkpoint_path, target=None)
     checkpoint_model_args = checkpoint['model_args']
     for k, v in model_args.items():
         assert checkpoint_model_args[k] == v, "for now"
         # TODO: think through how passed in params should interact with checkpoint params
     gptconf = GPTConfig(**model_args)
     model = GPT(gptconf)
-    state_dict = checkpoint['model']
-    # fix the keys of the state dictionary :(
-    # honestly no idea how checkpoints sometimes get this prefix, have to debug more
-    unwanted_prefix = '_orig_mod.'
-    for k,v in list(state_dict.items()):
-        if k.startswith(unwanted_prefix):
-            state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
-    model.load_state_dict(state_dict)
-    iter_num = checkpoint['iter_num']
+    empty_state = jax.eval_shape(lambda: model.create_state(**config))
+    state = serialization.from_state_dict(empty_state, checkpoint['state'])
+    iter_num = checkpoint['iter_num'] + 1
     best_val_loss = checkpoint['best_val_loss']
 elif init_from.startswith('gpt2'):
-    raise RuntimeError(f"Initializing from GPT-2 weights not supported yet")
     print(f"Initializing from OpenAI GPT-2 weights: {init_from}")
     # initialize from OpenAI GPT-2 weights
     override_args = dict(dropout=dropout)
-    model = GPT.from_pretrained(init_from, override_args)
+    model, params = GPT.from_pretrained(init_from, override_args)
+    state = model.create_state(**config)
     # read off and override the GPT sizing model args from the model config
     model_args['n_layer'] = model.config.n_layer
     model_args['n_head'] = model.config.n_head
     model_args['n_embd'] = model.config.n_embd
 else:
     raise RuntimeError(f"init_from={init_from} not supported")
-# crop down the model block size if desired
-if block_size < model.config.block_size:
-    params = model.crop_block_size(params, block_size)
-
-# learning rate decay scheduler (cosine with warmup)
-if decay_lr:
-    lr_schedule = optax.warmup_cosine_decay_schedule(
-        init_value=0.0, peak_value=learning_rate,
-        warmup_steps=warmup_iters, decay_steps=lr_decay_iters,
-        end_value=min_lr,
-    )
-else:
-    lr_schedule = learning_rate
-
-# %%
-# optimizer
-tx = model.configure_optimizers(params, weight_decay, lr_schedule, (beta1, beta2))
-state = train_state.TrainState.create(
-    apply_fn=model.apply, params=params, tx=tx)
 
 # %%
 @partial(jax.jit, static_argnames=('train',))
@@ -218,7 +195,6 @@ def sample(params, key, tokens) -> str:
     tokens = _sample(params, key, tokens)
     return tokenizer.decode(tokens[0])
 
-
 # logging
 if wandb_log:
     import wandb
@@ -247,9 +223,9 @@ while True:
             best_val_loss = losses['val']
             if iter_num > 0:
                 print(f"saving checkpoint to {out_dir}")
-                flax.training.checkpoints.save_checkpoint(
-                    ckpt_dir=os.path.join(out_dir, 'checkpoint'),
-                    target={
+                checkpoints.save_checkpoint(
+                    os.path.join(out_dir, 'checkpoint'),
+                    {
                         'state': state,
                         'model_args': model_args,
                         'iter_num': iter_num,
