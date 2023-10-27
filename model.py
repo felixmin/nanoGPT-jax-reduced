@@ -117,7 +117,8 @@ class GPT(nn.Module):
         self.h = [Block(config) for _ in range(config.n_layer)]
         self.ln_f = nn.LayerNorm()
 
-    def __call__(self, idx: jax.Array, *, train: bool, targets: Optional[jax.Array] = None):
+    def __call__(self, idx: jax.Array, *, deterministic: bool):
+        train = not deterministic
         b, t = idx.shape
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
         pos = jnp.arange(0, t, dtype=jnp.int32)[None] # shape (1, t)
@@ -132,14 +133,7 @@ class GPT(nn.Module):
 
         logits = self.wte.attend(x)
 
-        if targets is not None:
-            # if we are given some desired targets also calculate the loss
-            loss = optax.softmax_cross_entropy_with_integer_labels(
-                logits, targets).mean()
-        else:
-            loss = None
-
-        return logits, loss
+        return logits
 
     def crop_block_size(self, params, block_size: int):
         # model surgery to decrease the block size if necessary
@@ -157,111 +151,7 @@ class GPT(nn.Module):
             return x
 
         return freeze(path_aware_map(crop_weights, params))
-        
-
-    @classmethod
-    def from_pretrained(cls, model_type, override_args=None):
-        assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
-        override_args = override_args or {} # default to empty dict
-        # only dropout can be overridden see more notes below
-        assert all(k == 'dropout' for k in override_args)
-        from transformers import GPT2LMHeadModel
-        print("loading weights from pretrained gpt: %s" % model_type)
-
-        # n_layer, n_head and n_embd are determined from model_type
-        config_args = {
-            'gpt2':         dict(n_layer=12, n_head=12, n_embd=768),  # 124M params
-            'gpt2-medium':  dict(n_layer=24, n_head=16, n_embd=1024), # 350M params
-            'gpt2-large':   dict(n_layer=36, n_head=20, n_embd=1280), # 774M params
-            'gpt2-xl':      dict(n_layer=48, n_head=25, n_embd=1600), # 1558M params
-        }[model_type]
-        # we can override the dropout rate
-        if 'dropout' in override_args:
-            config_args['dropout'] = override_args['dropout']
-        # block_size is always 1024 for GPT model checkpoints
-        # if one wants a lower block_size it has to be done through model surgery
-        # later, by calling crop_block_shape
-
-        # create a from-scratch initialized minGPT model
-        config = GPTConfig(block_size=1024, **config_args)
-        model = GPT(config)
-        variables = jax.eval_shape(lambda: model.init(
-            jax.random.PRNGKey(0), jnp.ones((1, 1), dtype=jnp.int32), train=False))
-        params = variables['params']
-        flat_params = traverse_util.flatten_dict(params, sep='.')
-        
-
-        # init a huggingface/transformers model
-        model_hf = GPT2LMHeadModel.from_pretrained(model_type)
-        sd_hf = model_hf.state_dict()
-
-        def copy_from(flax_name, pt_name, transpose=False, add_head_dim=False):
-            pt_tensor = sd_hf[pt_name]
-            jax_array = flat_params[flax_name]
-            if transpose:
-                pt_tensor = pt_tensor.t()
-            pt_array = pt_tensor.detach().cpu().numpy()
-
-            if add_head_dim:
-                # pt_array = pt_array.reshape(*pt_array.shape[:-1], config.n_head, -1, 3)
-                pass
-
-            assert pt_array.shape == jax_array.shape
-
-            flat_params[flax_name] = pt_array
-
-        # transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
-        copy_from('wte.embedding', 'transformer.wte.weight')
-        copy_from('wpe.embedding', 'transformer.wpe.weight')
-
-        for i in range(config.n_layer):
-            copy_from(f'h_{i}.ln_1.scale', f'transformer.h.{i}.ln_1.weight')
-            copy_from(f'h_{i}.ln_1.bias', f'transformer.h.{i}.ln_1.bias')
-            copy_from(f'h_{i}.attn.c_attn.kernel', f'transformer.h.{i}.attn.c_attn.weight', add_head_dim=True)
-            copy_from(f'h_{i}.attn.c_attn.bias', f'transformer.h.{i}.attn.c_attn.bias', add_head_dim=True)
-            copy_from(f'h_{i}.attn.c_proj.kernel', f'transformer.h.{i}.attn.c_proj.weight')
-            copy_from(f'h_{i}.attn.c_proj.bias', f'transformer.h.{i}.attn.c_proj.bias')
-            copy_from(f'h_{i}.ln_2.scale', f'transformer.h.{i}.ln_2.weight')
-            copy_from(f'h_{i}.ln_2.bias', f'transformer.h.{i}.ln_2.bias')
-            copy_from(f'h_{i}.mlp.c_fc.kernel', f'transformer.h.{i}.mlp.c_fc.weight')
-            copy_from(f'h_{i}.mlp.c_fc.bias', f'transformer.h.{i}.mlp.c_fc.bias')
-            copy_from(f'h_{i}.mlp.c_proj.kernel', f'transformer.h.{i}.mlp.c_proj.weight')
-            copy_from(f'h_{i}.mlp.c_proj.bias', f'transformer.h.{i}.mlp.c_proj.bias')
-
-        copy_from('ln_f.scale', 'transformer.ln_f.weight')
-        copy_from('ln_f.bias', 'transformer.ln_f.bias')
-
-        params = freeze(traverse_util.unflatten_dict(flat_params, sep='.'))
-
-        return model, params
-
-    def configure_optimizers(self, params, weight_decay, learning_rate, betas):
-        """
-        This long function is unfortunately doing something very simple and is being very defensive:
-        We are separating out all parameters of the model into two buckets: those that will experience
-        weight decay for regularization and those that won't (biases, and layernorm/embedding weights).
-        We are then returning the PyTorch optimizer object.
-        """
-        def get_optimizer(decay):
-            return optax.adamw(
-                learning_rate=learning_rate, b1=betas[0], b2=betas[1],
-                weight_decay=decay)
-        
-        def partition_fn(path: Tuple[str, ...], x) -> str:
-            if path[-1] in ('bias', 'scale', 'embedding'):
-                return 'no_decay'
-            elif path[-1] in ('kernel',):
-                return 'decay'
-            else:
-                raise ValueError(f"Unrecognized parameter: {path}")
-
-        partition_optimizers = {    
-            'decay': get_optimizer(weight_decay), 
-            'no_decay': get_optimizer(0.0)}
-        param_partitions = freeze(path_aware_map(partition_fn, params))
-        tx = optax.multi_transform(partition_optimizers, param_partitions)
-
-        return tx
+    
 
     # @torch.no_grad()
     def generate(self, key, params, input_tokens, max_new_tokens, temperature=1.0, top_k=None):
@@ -284,7 +174,7 @@ class GPT(nn.Module):
             # if the sequence context is growing too long we must crop it at block_size
             # idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
             # forward the model to get the logits for the index in the sequence
-            logits, _ = self.apply({'params': params}, tokens, train=False)
+            logits = self.apply({'params': params}, tokens, train=False)
             # pluck the logits at the final step and scale by desired temperature
             logits = logits[:, i - 1, :] / temperature
             # optionally crop the logits to only the top k options
@@ -306,24 +196,11 @@ class GPT(nn.Module):
         return tokens
     
     def create_state(
-        self, learning_rate, weight_decay, beta1, beta2, 
-        decay_lr=None, warmup_iters=None, lr_decay_iters=None, min_lr=None,
-        params=None,
-        **kwargs
+        self, learning_rate, params=None, **kwargs
     ):
         if params is None:
             variables = self.init(jax.random.PRNGKey(0), jnp.ones((1, 1), dtype=jnp.int32), train=False)
             params = variables['params']
-        if decay_lr:
-            assert warmup_iters is not None and lr_decay_iters is not None and min_lr is not None
-            lr_schedule = optax.warmup_cosine_decay_schedule(
-                init_value=0.0, peak_value=learning_rate,
-                warmup_steps=warmup_iters, decay_steps=lr_decay_iters,
-                end_value=min_lr,
-            )
-        else:
-            lr_schedule = learning_rate
-        tx = self.configure_optimizers(
-            params, weight_decay=weight_decay, learning_rate=lr_schedule,
-            betas=(beta1, beta2))
+
+        tx = optax.adamw(learning_rate=learning_rate)
         return train_state.TrainState.create(apply_fn=self.apply, params=params, tx=tx)
